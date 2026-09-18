@@ -1,0 +1,245 @@
+npm run dev */
+
+import * as ROSLIB from 'roslib';
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ros bridge
+const ros = new ROSLIB.Ros({
+    url: 'ws://localhost:9090'
+});
+
+ros.on('connection', () => console.log('ros connected'));
+ros.on('error', (err) => console.log('ros err:', err));
+ros.on('close', () => console.log('ros closed'));
+
+const tactileTopic = new ROSLIB.Topic({
+    ros: ros,
+    name: '/tactile_sensors',
+    messageType: 'tactile_interfaces/msg/TactileSensor'
+});
+
+const sensorDots = {};
+
+tactileTopic.subscribe((msg) => {
+    console.log('sensor triggered:', msg.sensor_id, msg.intensity);
+
+    const dot = sensorDots[msg.sensor_id];
+    if (dot) {
+        // turn red and pop up when touched
+        dot.material.color.setHex(0xff0000);
+        dot.material.opacity = 1.0;
+        dot.scale.set(1.5, 1.5, 1.5);
+
+        // reset back
+        setTimeout(() => {
+            dot.material.color.setHex(0x00ffcc);
+            dot.material.opacity = 0.3;
+            dot.scale.set(1.0, 1.0, 1.0);
+        }, 400);
+    }
+});
+
+// scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x222222);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
+camera.position.set(0, 2, 4);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// lights
+scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+// headlight so we can see whatever side we look at
+const headlight = new THREE.DirectionalLight(0xffffff, 2.0);
+headlight.position.set(0, 0, 1);
+camera.add(headlight);
+scene.add(camera);
+
+// debug helpers
+scene.add(new THREE.AxesHelper(1));
+scene.add(new THREE.GridHelper(3, 10));
+
+// temp wireframe box to test coords
+const testBox = new THREE.Mesh(
+    new THREE.BoxGeometry(0.15, 0.15, 0.15),
+    new THREE.MeshBasicMaterial({ wireframe: true, color: 0xffff00 })
+);
+testBox.position.set(0, 0.2, 0.2);
+scene.add(testBox);
+
+// move box with arrow keys or w and s to find sensor spots
+
+
+// load model
+let robot = null;
+const loader = new GLTFLoader();
+const sphereGeo = new THREE.SphereGeometry(0.03, 16, 16);
+
+loader.load(
+    '/models/hiro-chan.glb',
+    (gltf) => {
+        robot = gltf.scene;
+
+        const sensorPosition = new THREE.Vector3(
+            -0.4611667607,
+            -0.0413638029,
+            0.2851935671
+        );
+
+        const influenceRadius = 0.15;
+
+        robot.traverse(function (object) {
+
+            if (!object.isMesh) {
+                return;
+            }
+
+            const position = object.geometry.attributes.position;
+
+            for (let i = 0; i < position.count; i++) {
+
+                const vertex = new THREE.Vector3();
+
+                vertex.fromBufferAttribute(position, i);
+
+                const distance = vertex.distanceTo(sensorPosition);
+
+                if (distance < influenceRadius) {
+                    console.log(
+                        "Affected vertex:",
+                        i,
+                        "Distance:",
+                        distance
+                    );
+                }
+            }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        const sensorPoints = [];
+        let sensorId = 1;
+
+        renderer.domElement.addEventListener('click', function (event) {
+
+            const rect = renderer.domElement.getBoundingClientRect();
+
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersections = raycaster.intersectObject(robot, true);
+
+            if (intersections.length === 0) {
+                return;
+            }
+
+            const intersection = intersections[0];
+
+            // Convert world position to Hiro-chan's local coordinates
+            const localPoint = robot.worldToLocal(
+                intersection.point.clone()
+            );
+
+            console.log("Sensor", sensorId);
+            console.log("X:", localPoint.x);
+            console.log("Y:", localPoint.y);
+            console.log("Z:", localPoint.z);
+
+            // Create a visible marker
+            const markerGeometry = new THREE.SphereGeometry(0.025, 16, 16);
+
+            const markerMaterial = new THREE.MeshBasicMaterial({
+                color: 0xff0000
+            });
+
+            const marker = new THREE.Mesh(
+                markerGeometry,
+                markerMaterial
+            );
+
+            marker.position.copy(intersection.point);
+
+            scene.add(marker);
+
+            // Store sensor information
+            sensorPoints.push({
+                sensor_id: sensorId,
+                x: localPoint.x,
+                y: localPoint.y,
+                z: localPoint.z
+            });
+
+            sensorId++;
+        });
+
+        // center model
+        const box = new THREE.Box3().setFromObject(robot);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        robot.position.sub(center);
+        scene.add(robot);
+
+        // hardcoded sensor spots on the body found using testBox
+        const points = {
+            'sensor_0': new THREE.Vector3(0, 0.35, 0.12),
+            'sensor_1': new THREE.Vector3(-0.15, 0.08, 0.15),
+            'sensor_2': new THREE.Vector3(0.15, 0.08, 0.15),
+            'sensor_3': new THREE.Vector3(0, 0.1, -0.15)
+        };
+
+        // add dots to robot
+        Object.keys(points).forEach((id) => {
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0x00ffcc,
+                transparent: true,
+                opacity: 0.3
+            });
+
+
+            // temp wireframe box to test coords
+            const testBox = new THREE.Mesh(
+            const dot = new THREE.Mesh(sphereGeo, mat);
+            dot.position.copy(points[id]);
+            robot.add(dot); // child of robot so it moves with it
+            sensorDots[id] = dot;
+        });
+
+        // auto frame camera
+        const maxDim = Math.max(size.x, size.y, size.z);
+        camera.position.set(0, maxDim * 0.3, maxDim * 1.6);
+        controls.target.set(0, 0, 0);
+        controls.update();
+    },
+    undefined,
+
+// temp wireframe box to test coords
+const testBox = new THREE.Mesh(
+        (err) => console.log('load error:', err)
+    );
+
+// resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// loop
+renderer.setAnimationLoop(() => {
+    controls.update();
+    renderer.render(scene, camera);
+});
