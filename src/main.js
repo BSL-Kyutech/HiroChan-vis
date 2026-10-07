@@ -1,22 +1,10 @@
-/* cd ~/threejs-project
-npm run dev */
+/* python3 ~/icepi_ros2_bridge.py /dev/ttyUSB0 */
 
-/* terminal 1 */
-/* source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash */
+/* ros2 launch rosbridge_server rosbridge_websocket_launch.xml *\
 
-/* terminal 2 */
 
-/* source /opt/ros/jazzy/setup.bash
-ros2 run rosbridge_server rosbridge_websocket */
 
-/* terminal 3 */
 
-/* source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash
-ros2 run tactile_backend sensor_simulator */
-
-/* terminal 4 */
 
 /* cd ~/threejs-project
 npm run dev */
@@ -26,17 +14,44 @@ import * as ROSLIB from 'roslib';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
 
 // -------------------------------------------------------------
-// 1. ROS 2 Bridge Connection
+// 1. ROS 2 Bridge Connection & HUD
 // -------------------------------------------------------------
-const ros = new ROSLIB.Ros({
-    url: 'ws://localhost:9090'
+const host = window.location.hostname || 'localhost';
+const statusBadge = document.getElementById('status-badge');
+const pressureBar = document.getElementById('pressure-bar');
+
+const ros = new ROSLIB.Ros();
+
+function connectRos() {
+    ros.connect(`ws://${host}:9090`);
+}
+
+ros.on('connection', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Connected';
+        statusBadge.className = 'hud-badge badge-connected';
+    }
 });
 
-ros.on('connection', () => console.log('Connected to rosbridge'));
-ros.on('error', (err) => console.log('ROS error:', err));
-ros.on('close', () => console.log('ROS connection closed'));
+ros.on('error', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Disconnected';
+        statusBadge.className = 'hud-badge badge-disconnected';
+    }
+    setTimeout(connectRos, 2500);
+});
+
+ros.on('close', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Disconnected';
+        statusBadge.className = 'hud-badge badge-disconnected';
+    }
+});
+
+connectRos();
 
 const tactileTopic = new ROSLIB.Topic({
     ros: ros,
@@ -45,51 +60,79 @@ const tactileTopic = new ROSLIB.Topic({
 });
 
 // -------------------------------------------------------------
-// 2. Constants & Data Buffers
+// Rosbag Web Recording Controller
 // -------------------------------------------------------------
-const NUM_TAXELS = 24;
+const recBtn = document.getElementById('rec-btn');
+let isRecording = false;
 
-// Target intensities updated from ROS 2
-const targetIntensities = new Float32Array(NUM_TAXELS);
+const recordService = new ROSLIB.Service({
+    ros: ros,
+    name: '/toggle_record',
+    serviceType: 'std_srvs/srv/SetBool'
+});
 
-// Current smoothed intensities for the GPU
-const liveIntensities = new Float32Array(NUM_TAXELS);
+if (recBtn) {
+    recBtn.addEventListener('click', () => {
+        const nextState = !isRecording;
+        recBtn.disabled = true;
+        recBtn.textContent = '...';
 
-// Local surface coordinates on Hiro-chan (fallback default array)
-let taxelLocalPositions = Array.from({ length: NUM_TAXELS }, () => new THREE.Vector3(999.0, 999.0, 999.0));
+        const timeout = setTimeout(() => {
+            recBtn.disabled = false;
+            recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            console.warn('Timed out waiting for /toggle_record service response.');
+        }, 4000);
 
-// World coordinates updated each frame
-const taxelWorldPositions = Array.from({ length: NUM_TAXELS }, () => new THREE.Vector3(999.0, 999.0, 999.0));
+        // Pass a plain object directly instead of "new ROSLIB.ServiceRequest"
+        const request = {
+            data: nextState
+        };
+
+        recordService.callService(request, (result) => {
+            clearTimeout(timeout);
+            recBtn.disabled = false;
+            if (result && result.success) {
+                isRecording = nextState;
+                if (isRecording) {
+                    recBtn.textContent = '■ Stop Recording';
+                    recBtn.style.background = '#2b6cb0'; // Blue when recording
+                } else {
+                    recBtn.textContent = '● Record Bag';
+                    recBtn.style.background = '#e53e3e'; // Red when idle
+                }
+            } else {
+                console.warn('Service returned failure:', result?.message);
+                recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            }
+        }, (error) => {
+            clearTimeout(timeout);
+            recBtn.disabled = false;
+            recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            console.error('Failed to call /toggle_record service:', error);
+        });
+    });
+}
 
 // -------------------------------------------------------------
-// 3. Three.js Scene, Camera & WebGL Renderer
+// 2. Scene Setup
 // -------------------------------------------------------------
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1a1a1a);
+scene.background = new THREE.Color(0x222222);
 
-const camera = new THREE.PerspectiveCamera(
-    60,
-    window.innerWidth / window.innerHeight,
-    0.01,
-    1000
-);
-camera.position.set(0, 1.8, 3.2);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
+camera.position.set(0, 2, 4);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-document.body.style.margin = '0';
-document.body.style.overflow = 'hidden';
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
-// Lighting setup
 scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-
-const dirLight = new THREE.DirectionalLight(0xffffff, 1.6);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
 dirLight.position.set(2, 4, 3);
 scene.add(dirLight);
 
@@ -98,37 +141,42 @@ headlight.position.set(0, 0, 1);
 camera.add(headlight);
 scene.add(camera);
 
-scene.add(new THREE.GridHelper(4, 12, 0x444444, 0x222222));
+scene.add(new THREE.AxesHelper(1));
+scene.add(new THREE.GridHelper(3, 10));
 
-// -------------------------------------------------------------
-// 4. Multi-Taxel GPU Shader
-// -------------------------------------------------------------
-const touchUniforms = {
-    uTaxelPos: { value: taxelWorldPositions },
-    uTaxelIntensity: { value: liveIntensities },
-    uRadius: { value: 0.16 },  // Contact spread per sensor
-    uDepth: { value: 0.12 }   // Physical dent depth
+let robot = null;
+const robotMeshes = [];
+const activeShaders = [];
+
+const touchState = {
+    pos: new THREE.Vector3(0.0, 0.0, 0.0),
+    intensity: 0.0,
+    radius: 0.26,
+    depth: 0.5
 };
+let targetIntensity = 0.0;
 
+// -------------------------------------------------------------
+// 3. Deformable Shader Setup
+// -------------------------------------------------------------
 function setupDeformableMaterial(mat) {
-    mat.roughness = 0.35;
-    mat.metalness = 0.05;
+    mat.roughness = 0.1;
+    mat.metalness = 0.02;
 
     mat.onBeforeCompile = (shader) => {
-        shader.uniforms.uTaxelPos = touchUniforms.uTaxelPos;
-        shader.uniforms.uTaxelIntensity = touchUniforms.uTaxelIntensity;
-        shader.uniforms.uRadius = touchUniforms.uRadius;
-        shader.uniforms.uDepth = touchUniforms.uDepth;
+        shader.uniforms.uTouchPos = { value: touchState.pos };
+        shader.uniforms.uIntensity = { value: 0.0 };
+        shader.uniforms.uRadius = { value: touchState.radius };
+        shader.uniforms.uDepth = { value: touchState.depth };
 
-        // Vertex Shader: Multi-taxel displacement
+        activeShaders.push(shader);
+
         shader.vertexShader = `
-            #define NUM_TAXELS 24
-            uniform vec3 uTaxelPos[NUM_TAXELS];
-            uniform float uTaxelIntensity[NUM_TAXELS];
+            uniform vec3 uTouchPos;
+            uniform float uIntensity;
             uniform float uRadius;
             uniform float uDepth;
-            varying vec3 vWorldPos;
-            varying float vTotalIntensity;
+            varying float vFactor;
         ` + shader.vertexShader;
 
         shader.vertexShader = shader.vertexShader.replace(
@@ -136,58 +184,46 @@ function setupDeformableMaterial(mat) {
             `
             #include <begin_vertex>
             vec4 worldP = modelMatrix * vec4(position, 1.0);
-            vWorldPos = worldP.xyz;
-            vTotalIntensity = 0.0;
+            vFactor = 0.0;
 
-            float netDisp = 0.0;
-            vec3 accumSlope = vec3(0.0);
+            if (uIntensity > 0.02) {
+                float d = distance(worldP.xyz, uTouchPos);
+                if (d < uRadius) {
+                    vec3 localTouch = (inverse(modelMatrix) * vec4(uTouchPos, 1.0)).xyz;
+                    vec3 toTouch = localTouch - position;
+                    vec3 dirToTouch = normalize(toTouch);
 
-            for (int i = 0; i < NUM_TAXELS; i++) {
-                float intensity = uTaxelIntensity[i];
-                if (intensity > 0.01) {
-                    float d = distance(worldP.xyz, uTaxelPos[i]);
-                    if (d < uRadius) {
-                        vec3 localTouch = (inverse(modelMatrix) * vec4(uTaxelPos[i], 1.0)).xyz;
-                        vec3 toTouch = localTouch - position;
-                        vec3 dirToTouch = normalize(toTouch);
+                    float front = clamp(dot(normal, dirToTouch) + 0.6, 0.0, 1.0);
+                    float r = d / uRadius;
+                    float indent = 0.5 * (1.0 + cos(r * 3.14159265));
+                    float disp = indent * uIntensity * front;
 
-                        // Normal gating: only deform front-facing surface
-                        float front = max(0.0, dot(normal, dirToTouch));
-                        float r = d / uRadius;
+                    transformed -= normal * (disp * uDepth);
 
-                        // Cosine indentation profile
-                        float falloff = 0.5 * (1.0 + cos(r * 3.14159265)) * intensity * front;
-                        netDisp += falloff;
-
-                        // Surface slope tilt
-                        vec3 tangent = normalize(toTouch - normal * dot(toTouch, normal));
-                        accumSlope += tangent * (falloff * 2.0);
-
-                        vTotalIntensity += falloff;
+                    vec3 tangentSlope = toTouch - normal * dot(toTouch, normal);
+                    if (length(tangentSlope) > 1e-4) {
+                        tangentSlope = normalize(tangentSlope);
+                        objectNormal = normalize(objectNormal + tangentSlope * (disp * 3.0));
                     }
+
+                    vFactor = disp;
                 }
             }
-
-            netDisp = min(netDisp, 1.5);
-            transformed -= normal * (netDisp * uDepth);
-            objectNormal = normalize(objectNormal + accumSlope);
-            vTotalIntensity = clamp(vTotalIntensity, 0.0, 1.0);
             `
         );
 
-        // Fragment Shader: Heatmap gradient
         shader.fragmentShader = `
-            varying vec3 vWorldPos;
-            varying float vTotalIntensity;
+            varying float vFactor;
 
             vec3 getTactileColor(float t) {
-                vec3 c0 = vec3(0.10, 0.25, 0.85); // Blue
-                vec3 c1 = vec3(0.10, 0.75, 0.65); // Cyan
-                vec3 c2 = vec3(0.95, 0.80, 0.15); // Yellow
-                vec3 c3 = vec3(0.92, 0.25, 0.10); // Red
+                vec3 c0 = vec3(0.05, 0.20, 0.90);
+                vec3 c1 = vec3(0.00, 0.85, 0.95);
+                vec3 c2 = vec3(1.00, 0.85, 0.05);
+                vec3 c3 = vec3(0.95, 0.05, 0.05);
+
                 if (t < 0.33) return mix(c0, c1, t / 0.33);
-                if (t < 0.66) return mix(c1, c2, (t - 0.33) / 0.33);
-                return mix(c2, c3, (t - 0.66) / 0.34);
+                else if (t < 0.66) return mix(c1, c2, (t - 0.33) / 0.33);
+                else return mix(c2, c3, (t - 0.66) / 0.34);
             }
         ` + shader.fragmentShader;
 
@@ -195,17 +231,10 @@ function setupDeformableMaterial(mat) {
             '#include <dithering_fragment>',
             `
             #include <dithering_fragment>
-            if (vTotalIntensity > 0.01) {
-                float p = vTotalIntensity;
+            if (vFactor > 0.04) {
+                float p = clamp((vFactor - 0.04) * 4.0, 0.0, 1.0);
                 vec3 heat = getTactileColor(p);
-
-                // Topographic isobar rings
-                float rings = mod(p * 7.0, 1.0);
-                if (rings > 0.88) {
-                    heat = mix(heat, vec3(0.05), 0.45);
-                }
-
-                gl_FragColor.rgb = mix(gl_FragColor.rgb, heat, p * 0.92);
+                gl_FragColor.rgb = mix(gl_FragColor.rgb, heat, clamp(p * 2.5, 0.0, 0.95));
             }
             `
         );
@@ -215,27 +244,38 @@ function setupDeformableMaterial(mat) {
 }
 
 // -------------------------------------------------------------
-// 5. Model Loading
+// 4. Model Loading
 // -------------------------------------------------------------
-let robot = null;
-const robotMeshes = [];
 const loader = new GLTFLoader();
 
 loader.load(
     '/models/hiro-chan.glb',
     (gltf) => {
-        console.log('Hiro-chan loaded');
         robot = gltf.scene;
 
         robot.traverse((child) => {
             if (child.isMesh && child.geometry) {
+                child.geometry.deleteAttribute('normal');
+                child.geometry = BufferGeometryUtils.mergeVertices(child.geometry, 0.0015);
                 child.geometry.computeVertexNormals();
-                child.geometry.computeBoundingBox();
-                child.geometry.computeBoundingSphere();
+
+                const normAttr = child.geometry.attributes.normal;
+                if (normAttr) {
+                    for (let i = 0; i < normAttr.count; i++) {
+                        const nx = normAttr.getX(i);
+                        const ny = normAttr.getY(i);
+                        const nz = normAttr.getZ(i);
+                        if (isNaN(nx) || isNaN(ny) || isNaN(nz) || (nx === 0 && ny === 0 && nz === 0)) {
+                            normAttr.setXYZ(i, 0, 1, 0);
+                        }
+                    }
+                    normAttr.needsUpdate = true;
+                }
 
                 robotMeshes.push(child);
                 child.material = child.material.clone();
-                child.material.side = THREE.DoubleSide;
+                child.material.flatShading = false;
+                child.material.side = THREE.FrontSide;
                 setupDeformableMaterial(child.material);
             }
         });
@@ -253,183 +293,85 @@ loader.load(
         controls.target.set(0, 0, 0);
         controls.update();
 
-        // Check if saved calibration exists in localStorage
-        loadSavedCalibration();
+        const autoRay = new THREE.Raycaster(
+            new THREE.Vector3(0, 0.05, maxDim * 1.5),
+            new THREE.Vector3(0, 0, -1)
+        );
+        const hits = autoRay.intersectObjects(robotMeshes, true);
+        if (hits.length > 0) {
+            touchState.pos.copy(hits[0].point);
+        }
     }
 );
 
 // -------------------------------------------------------------
-// 6. Interactive Calibration Tool (UI & Pin Markers)
+// 5. Hardware / Rosbag Touch Routing (Throttled & Time-Filtered)
 // -------------------------------------------------------------
-let calibrationActive = false;
-let currentCalibIndex = 0;
-const markerGroup = new THREE.Group();
-scene.add(markerGroup);
+const THRESHOLD_LOW = 0.04;    // Release threshold
+const THRESHOLD_HIGH = 0.06;   // Press threshold
+const MAX_PRESSURE = 0.20;
 
-function createMarkerPin(index, pos) {
-    const geom = new THREE.SphereGeometry(0.018, 16, 16);
-    const mat = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.position.copy(pos);
-    mesh.name = `marker_S${index}`;
-    markerGroup.add(mesh);
-}
+let lastProcessTime = 0;
+const THROTTLE_MS = 16;        // Limit processing to ~60 Hz
 
-function updateMarkerPositions() {
-    if (!robot) return;
-    markerGroup.clear();
-    for (let i = 0; i < NUM_TAXELS; i++) {
-        if (taxelLocalPositions[i].x !== 999.0) {
-            const worldPos = taxelLocalPositions[i].clone().applyMatrix4(robot.matrixWorld);
-            createMarkerPin(i, worldPos);
-        }
-    }
-}
+let highSince = 0;             // Timestamp when pressure first crossed threshold
+const MIN_TOUCH_DURATION_MS = 40; // Must stay pressed for >40ms to count (kills spikes)
 
-// Calibration UI Overlay
-const ui = document.createElement('div');
-ui.style.position = 'fixed';
-ui.style.top = '15px';
-ui.style.left = '15px';
-ui.style.zIndex = '9999';
-ui.style.backgroundColor = 'rgba(0, 0, 0, 0.85)';
-ui.style.color = '#fff';
-ui.style.fontFamily = 'monospace';
-ui.style.padding = '14px 18px';
-ui.style.borderRadius = '8px';
-ui.style.lineHeight = '1.6';
-ui.innerHTML = `
-    <div style="font-weight:bold; font-size:14px; margin-bottom:6px; color:#00ffcc;">TAXEL CALIBRATION</div>
-    <div id="calib-status">Mode: Normal Visualization</div>
-    <div style="margin-top:10px; display:flex; gap:8px;">
-        <button id="btn-toggle-calib" style="cursor:pointer; padding:5px 10px; background:#00ffcc; border:none; border-radius:4px; font-weight:bold;">Start Calib</button>
-        <button id="btn-export-json" style="cursor:pointer; padding:5px 10px; background:#444; color:#fff; border:none; border-radius:4px;">Export JSON</button>
-        <button id="btn-clear-calib" style="cursor:pointer; padding:5px 10px; background:#662222; color:#fff; border:none; border-radius:4px;">Reset</button>
-    </div>
-`;
-document.body.appendChild(ui);
-
-const statusDiv = document.getElementById('calib-status');
-const toggleBtn = document.getElementById('btn-toggle-calib');
-const exportBtn = document.getElementById('btn-export-json');
-const clearBtn = document.getElementById('btn-clear-calib');
-
-toggleBtn.addEventListener('click', () => {
-    calibrationActive = !calibrationActive;
-    if (calibrationActive) {
-        toggleBtn.textContent = 'Finish Calib';
-        toggleBtn.style.background = '#ffaa00';
-        statusDiv.innerHTML = `<span style="color:#ffaa00;">Click Hiro-chan for: <b>S${currentCalibIndex}</b></span>`;
-    } else {
-        toggleBtn.textContent = 'Start Calib';
-        toggleBtn.style.background = '#00ffcc';
-        statusDiv.textContent = 'Mode: Normal Visualization';
-    }
-});
-
-exportBtn.addEventListener('click', () => {
-    const exportData = taxelLocalPositions.map((v, i) => ({
-        id: i,
-        x: Number(v.x.toFixed(4)),
-        y: Number(v.y.toFixed(4)),
-        z: Number(v.z.toFixed(4))
-    }));
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'taxel_map.json';
-    a.click();
-    URL.revokeObjectURL(url);
-});
-
-clearBtn.addEventListener('click', () => {
-    if (confirm('Clear all taxel calibration points?')) {
-        localStorage.removeItem('hiro_taxel_map');
-        taxelLocalPositions = Array.from({ length: NUM_TAXELS }, () => new THREE.Vector3(999.0, 999.0, 999.0));
-        currentCalibIndex = 0;
-        updateMarkerPositions();
-        statusDiv.textContent = 'Calibration cleared.';
-    }
-});
-
-function loadSavedCalibration() {
-    const saved = localStorage.getItem('hiro_taxel_map');
-    if (saved) {
-        try {
-            const parsed = JSON.parse(saved);
-            parsed.forEach((pt) => {
-                if (pt.id < NUM_TAXELS) {
-                    taxelLocalPositions[pt.id].set(pt.x, pt.y, pt.z);
-                }
-            });
-            updateMarkerPositions();
-            console.log('Restored taxel map from localStorage');
-        } catch (e) {
-            console.error('Failed parsing localStorage taxel map:', e);
-        }
-    }
-}
-
-// Raycasting for Calibration Clicks
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-
-renderer.domElement.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0 || !calibrationActive || !robot) return;
-
-    const rect = renderer.domElement.getBoundingClientRect();
-    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-    raycaster.setFromCamera(mouse, camera);
-    const intersects = raycaster.intersectObjects(robotMeshes, true);
-
-    if (intersects.length === 0) return;
-
-    const hit = intersects[0];
-
-    // Convert world intersection to robot local coordinates
-    const localHit = robot.worldToLocal(hit.point.clone());
-    taxelLocalPositions[currentCalibIndex].copy(localHit);
-
-    console.log(`Assigned S${currentCalibIndex} -> local:`, localHit);
-
-    // Save progress to localStorage
-    const toSave = taxelLocalPositions.map((v, i) => ({ id: i, x: v.x, y: v.y, z: v.z }));
-    localStorage.setItem('hiro_taxel_map', JSON.stringify(toSave));
-
-    updateMarkerPositions();
-
-    currentCalibIndex++;
-    if (currentCalibIndex >= NUM_TAXELS) {
-        currentCalibIndex = 0;
-        statusDiv.innerHTML = `<span style="color:#00ffcc;">All 24 Taxels Calibrated!</span>`;
-    } else {
-        statusDiv.innerHTML = `<span style="color:#ffaa00;">Click Hiro-chan for: <b>S${currentCalibIndex}</b></span>`;
-    }
-});
-
-// -------------------------------------------------------------
-// 7. ROS 2 Live Data Subscription
-// -------------------------------------------------------------
 tactileTopic.subscribe((msg) => {
-    // Fill the live target buffer directly with all 24 channels
-    for (let i = 0; i < NUM_TAXELS && i < msg.data.length; i++) {
-        targetIntensities[i] = msg.data[i];
+    const now = performance.now();
+    
+    // Throttle: ignore excess messages from the 1200+ Hz flood
+    if (now - lastProcessTime < THROTTLE_MS) {
+        return;
+    }
+    lastProcessTime = now;
+
+    if (!msg.data || msg.data.length === 0) return;
+
+    let maxVal = 0.0;
+    for (let i = 0; i < msg.data.length; i++) {
+        if (msg.data[i] > maxVal) {
+            maxVal = msg.data[i];
+        }
+    }
+
+    // Time-based anti-spike logic
+    if (maxVal >= THRESHOLD_HIGH) {
+        if (highSince === 0) {
+            highSince = now; // Start tracking contact duration
+        }
+    } else if (maxVal < THRESHOLD_LOW) {
+        highSince = 0; // Released
+    }
+
+    // Reject short spikes lasting under 40 milliseconds
+    if (highSince === 0 || (now - highSince) < MIN_TOUCH_DURATION_MS) {
+        targetIntensity = 0.0;
+        if (pressureBar) pressureBar.style.width = '0%';
+        return;
+    }
+
+    // Remap to 0.0 - 1.0 range
+    const range = MAX_PRESSURE - THRESHOLD_LOW;
+    const normalized = Math.min(Math.max((maxVal - THRESHOLD_LOW) / range, 0.0), 1.0);
+
+    targetIntensity = normalized;
+    if (pressureBar) {
+        pressureBar.style.width = `${normalized * 100}%`;
     }
 });
 
-// Window resize
+// -------------------------------------------------------------
+// 6. Window Resize
+// -------------------------------------------------------------
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 });
 
 // -------------------------------------------------------------
-// 8. Animation & Damping Loop
+// 7. Animation Loop
 // -------------------------------------------------------------
 let lastTime = performance.now();
 
@@ -438,22 +380,24 @@ renderer.setAnimationLoop(() => {
     const delta = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
 
-    if (robot) {
-        for (let i = 0; i < NUM_TAXELS; i++) {
-            // Update live world position for each taxel
-            if (taxelLocalPositions[i].x !== 999.0) {
-                taxelWorldPositions[i]
-                    .copy(taxelLocalPositions[i])
-                    .applyMatrix4(robot.matrixWorld);
-            }
+    touchState.intensity = THREE.MathUtils.damp(
+        touchState.intensity,
+        targetIntensity,
+        25.0,
+        delta
+    );
 
-            // Viscoelastic response dampening
-            liveIntensities[i] = THREE.MathUtils.damp(
-                liveIntensities[i],
-                targetIntensities[i],
-                8.0,
-                delta
-            );
+    // Snap cleanly to zero
+    if (touchState.intensity < 0.01) {
+        touchState.intensity = 0.0;
+    }
+
+    // Direct uniform binding per frame
+    for (let i = 0; i < activeShaders.length; i++) {
+        const u = activeShaders[i].uniforms;
+        if (u && u.uIntensity) {
+            u.uIntensity.value = touchState.intensity;
+            u.uTouchPos.value.copy(touchState.pos);
         }
     }
 

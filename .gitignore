@@ -27,3 +27,18 @@ node_modules/
 dist/
 .vite/
 .env
+# Dependencies & Vite
+node_modules/
+dist/
+.vite/
+
+# Rosbags & System data
+tactile_bags/
+*.mcap
+*.db3
+*.metadata.yaml
+log/
+.ros/
+__pycache__/
+*.pyc
+.DS_Store
