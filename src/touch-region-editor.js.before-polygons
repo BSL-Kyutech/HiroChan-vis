@@ -1,0 +1,424 @@
+import * as THREE from "three";
+
+export class TouchRegionEditor {
+  constructor({ scene, camera, renderer, controls, robot }) {
+    Object.assign(this, { scene, camera, renderer, controls, robot });
+    this.raycaster = new THREE.Raycaster();
+    this.pointer = new THREE.Vector2();
+    this.regions = [];
+    this.pending = null;
+    this.placing = false;
+    this.selected = -1;
+
+    this.overlay = new THREE.Group();
+    scene.add(this.overlay);
+    this._buildPanel();
+
+    this._onClick = this._onClick.bind(this);
+    renderer.domElement.addEventListener("pointerdown", this._onClick);
+  }
+
+  _buildPanel() {
+    const panel = document.createElement("div");
+    panel.style.cssText = `
+      position:fixed;right:12px;top:12px;z-index:9999;width:270px;
+      max-height:80vh;overflow:auto;padding:12px;background:#171a21;
+      color:white;border-radius:8px;font:13px system-ui;
+    `;
+    panel.innerHTML = `
+      <b>Touch Region Editor</b>
+      <input id="tre-name" placeholder="Patch name"
+        style="box-sizing:border-box;width:100%;margin:8px 0;padding:7px">
+      <button id="tre-place">Place centre</button>
+      <label>Radius: <span id="tre-rval">0.035</span> m</label>
+      <input id="tre-radius" type="range"
+        min="0.005" max="0.36" step="0.001" value="0.035">
+      <label>Width: <span id="tre-wval">0.070</span> m</label>
+      <input id="tre-width" type="range"
+        min="0.01" max="0.75" step="0.005" value="0.07">
+      <label>Height: <span id="tre-hval">0.070</span> m</label>
+      <input id="tre-height" type="range"
+        min="0.01" max="0.75" step="0.005" value="0.07">
+      <button id="tre-save">Save region</button>
+      <select id="tre-list" size="4" style="width:100%;margin-top:8px"></select>
+      <button id="tre-update">Update selected</button>
+      <button id="tre-delete">Delete selected</button>
+      <button id="tre-export">Export JSON</button>
+      <button id="tre-import">Import JSON</button>
+      <input id="tre-file" type="file" accept=".json" style="display:none">
+      <button id="tre-hide">Hide editor</button>
+      <p id="tre-status">Enter a name and place a centre.</p>
+    `;
+    document.body.appendChild(panel);
+    this.panel = panel;
+
+    const $ = id => panel.querySelector(`#tre-${id}`);
+    this.nameInput = $("name");
+    this.status = $("status");
+    this.list = $("list");
+    this.radiusInput = $("radius");
+    this.widthInput = $("width");
+    this.heightInput = $("height");
+
+    $("place").onclick = () => {
+      this.placing = true;
+      this.pending = null;
+      this.status.textContent = "Click once on the robot surface.";
+    };
+    $("save").onclick = () => this.savePending();
+    $("update").onclick = () => this.updateSelected();
+    $("delete").onclick = () => this.deleteSelected();
+    $("export").onclick = () => this.exportJSON();
+    $("import").onclick = () => $("file").click();
+    $("file").onchange = e => this.importFile(e);
+    this.list.onchange = () => this.selectRegion(Number(this.list.value));
+
+    $("hide").onclick = () => {
+      panel.style.display = "none";
+      const show = document.createElement("button");
+      show.textContent = "Show region editor";
+      show.style.cssText =
+        "position:fixed;right:12px;top:12px;z-index:10000;padding:8px";
+      show.onclick = () => {
+        panel.style.display = "block";
+        show.remove();
+      };
+      document.body.appendChild(show);
+    };
+
+    const updateSize = () => {
+      this.radius = Number(this.radiusInput.value);
+      this.width = Number(this.widthInput.value);
+      this.height = Number(this.heightInput.value);
+      $("rval").textContent = this.radius.toFixed(3);
+      $("wval").textContent = this.width.toFixed(3);
+      $("hval").textContent = this.height.toFixed(3);
+      this.redraw();
+    };
+    this.radiusInput.oninput = updateSize;
+    this.widthInput.oninput = updateSize;
+    this.heightInput.oninput = updateSize;
+    updateSize();
+  }
+  _onClick(event) {
+    if (!this.placing || event.button !== 0) return;
+    if (this.panel.contains(event.target)) return;
+
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObject(this.robot, true);
+
+console.log("Robot:", this.robot);
+console.log("Canvas:", this.renderer.domElement);
+console.log("Ray hits:", hits.length);
+console.log("Hit objects:", hits.slice(0, 5).map(hit => ({
+  name: hit.object.name,
+  type: hit.object.type,
+  isMesh: hit.object.isMesh,
+  distance: hit.distance,
+  hasFace: !!hit.face
+})));
+
+if (!hits.length || !hits[0].face) {
+  this.status.textContent = `No valid mesh hit. Intersections: ${hits.length}.`;
+  return;
+}
+
+    const hit = hits[0];
+    const mesh = hit.object;
+    const geometry = mesh.geometry;
+    const face = hit.face;
+    const index = geometry.index;
+    const triangle = index
+      ? [
+          index.getX(hit.faceIndex * 3),
+          index.getX(hit.faceIndex * 3 + 1),
+          index.getX(hit.faceIndex * 3 + 2)
+        ]
+      : [face.a, face.b, face.c];
+
+    const position = geometry.attributes.position;
+    const localPoint = mesh.worldToLocal(hit.point.clone());
+    const a = new THREE.Vector3().fromBufferAttribute(position, triangle[0]);
+    const b = new THREE.Vector3().fromBufferAttribute(position, triangle[1]);
+    const c = new THREE.Vector3().fromBufferAttribute(position, triangle[2]);
+    const bary = new THREE.Vector3();
+    THREE.Triangle.getBarycoord(localPoint, a, b, c, bary);
+
+    const meshPath = [];
+    let node = mesh;
+    while (node && node !== this.robot) {
+      const parent = node.parent;
+      if (!parent) break;
+      meshPath.unshift(parent.children.indexOf(node));
+      node = parent;
+    }
+
+    this.pending = {
+      meshPath,
+      triangle,
+      barycentric: [bary.x, bary.y, bary.z],
+      radius: this.radius,
+      width: this.width,
+      height: this.height
+    };
+
+    this.placing = false;
+    this.status.textContent = "Centre placed. Adjust the size and save.";
+    this.redraw();
+  }
+
+  _resolvePoint(point) {
+    let mesh = this.robot;
+    for (const i of point.meshPath) {
+      mesh = mesh.children[i];
+      if (!mesh) return null;
+    }
+    if (!mesh.isMesh) return null;
+
+    const position = mesh.geometry.attributes.position;
+    const [ia, ib, ic] = point.triangle;
+    if ([ia, ib, ic].some(i => i >= position.count)) return null;
+
+    const a = new THREE.Vector3().fromBufferAttribute(position, ia);
+    const b = new THREE.Vector3().fromBufferAttribute(position, ib);
+    const c = new THREE.Vector3().fromBufferAttribute(position, ic);
+    const [u, v, w] = point.barycentric;
+
+    const local = a.multiplyScalar(u)
+      .addScaledVector(b, v)
+      .addScaledVector(c, w);
+
+    mesh.updateWorldMatrix(true, false);
+    return mesh.localToWorld(local);
+  }
+
+  _normalAt(point) {
+    let mesh = this.robot;
+    for (const i of point.meshPath) mesh = mesh?.children[i];
+    if (!mesh?.isMesh) return new THREE.Vector3(0, 0, 1);
+
+    const pos = mesh.geometry.attributes.position;
+    const [ia, ib, ic] = point.triangle;
+    const a = new THREE.Vector3().fromBufferAttribute(pos, ia);
+    const b = new THREE.Vector3().fromBufferAttribute(pos, ib);
+    const c = new THREE.Vector3().fromBufferAttribute(pos, ic);
+    const normal = new THREE.Triangle(a, b, c).getNormal(new THREE.Vector3());
+
+    mesh.updateWorldMatrix(true, false);
+    return normal.transformDirection(mesh.matrixWorld).normalize();
+  }
+
+_drawRegion(point, color) {
+  const centre = this._resolvePoint(point);
+  if (!centre) return;
+
+  const normal = this._normalAt(point);
+
+  // Build two directions tangent to the surface at the centre.
+  const view = this.camera.position.clone().sub(centre).normalize();
+  let tangent = new THREE.Vector3()
+    .crossVectors(normal, view)
+    .normalize();
+
+  if (tangent.lengthSq() < 1e-6) {
+    tangent = new THREE.Vector3(1, 0, 0);
+    tangent.addScaledVector(normal, -tangent.dot(normal)).normalize();
+  }
+
+  const bitangent = new THREE.Vector3()
+    .crossVectors(normal, tangent)
+    .normalize();
+
+  const rx = (point.width ?? point.radius * 2) / 2;
+  const ry = (point.height ?? point.radius * 2) / 2;
+  const segments = 96;
+  const vertices = [];
+
+  // Cast from slightly outside each intended boundary point back
+  // toward the robot, so the outline follows the mesh surface.
+  for (let i = 0; i <= segments; i++) {
+    const angle = (i / segments) * Math.PI * 2;
+
+    const offset = tangent.clone()
+      .multiplyScalar(Math.cos(angle) * rx)
+      .addScaledVector(bitangent, Math.sin(angle) * ry);
+
+    const target = centre.clone().add(offset);
+    const rayOrigin = target.clone().addScaledVector(normal, Math.max(rx, ry) + 0.05);
+    const rayDirection = normal.clone().negate();
+
+    this.raycaster.set(rayOrigin, rayDirection);
+    this.raycaster.near = 0;
+    this.raycaster.far = 2 * Math.max(rx, ry) + 0.1;
+
+    const hits = this.raycaster.intersectObject(this.robot, true);
+
+    if (hits.length) {
+      vertices.push(
+        hits[0].point.clone()
+          .addScaledVector(hits[0].face.normal, 0.001)
+      );
+    } else {
+      // If the surface cannot be reached from this direction,
+      // skip that boundary point rather than drawing it in the air.
+      vertices.push(null);
+    }
+  }
+
+  // Draw separate line segments only where both endpoints hit the mesh.
+  const material = new THREE.LineBasicMaterial({
+    color,
+    depthTest: false
+  });
+
+  for (let i = 0; i < vertices.length - 1; i++) {
+    if (!vertices[i] || !vertices[i + 1]) continue;
+
+    const geometry = new THREE.BufferGeometry().setFromPoints([
+      vertices[i],
+      vertices[i + 1]
+    ]);
+
+    const line = new THREE.Line(geometry, material);
+    line.renderOrder = 1000;
+    this.overlay.add(line);
+  }
+
+  // Centre marker
+  const marker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.0045, 12, 8),
+    new THREE.MeshBasicMaterial({ color, depthTest: false })
+  );
+
+  marker.position.copy(centre).addScaledVector(normal, 0.002);
+  marker.renderOrder = 1001;
+  this.overlay.add(marker);
+}
+
+
+  redraw() {
+    this.overlay.clear();
+
+    this.regions.forEach((region, i) => {
+      this._drawRegion(region, i === this.selected ? 0x00ff88 : 0xffb52e);
+    });
+
+    if (this.pending) this._drawRegion(this.pending, 0x36b8ff);
+  }
+
+  savePending() {
+    if (!this.pending) {
+      this.status.textContent = "Click Place centre first.";
+      return;
+    }
+
+    const name = this.nameInput.value.trim();
+    if (!name) {
+      this.status.textContent = "Enter a region name first.";
+      return;
+    }
+
+    this.regions.push({ name, ...this.pending });
+    this.selected = this.regions.length - 1;
+    this.pending = null;
+    this._updateList();
+    this.redraw();
+    this.status.textContent = `Saved "${name}".`;
+  }
+
+  selectRegion(index) {
+    if (!this.regions[index]) return;
+    this.selected = index;
+    const region = this.regions[index];
+
+    this.nameInput.value = region.name;
+    this.radiusInput.value = region.radius ?? 0.035;
+    this.widthInput.value = region.width ?? 0.07;
+    this.heightInput.value = region.height ?? 0.07;
+
+    this.radiusInput.dispatchEvent(new Event("input"));
+    this.redraw();
+  }
+
+  updateSelected() {
+    const region = this.regions[this.selected];
+    if (!region) {
+      this.status.textContent = "Select a saved region first.";
+      return;
+    }
+
+    region.name = this.nameInput.value.trim() || region.name;
+    region.radius = this.radius;
+    region.width = this.width;
+    region.height = this.height;
+
+    this._updateList();
+    this.redraw();
+    this.status.textContent = "Region updated.";
+  }
+
+  deleteSelected() {
+    if (!this.regions[this.selected]) return;
+    this.regions.splice(this.selected, 1);
+    this.selected = -1;
+    this._updateList();
+    this.redraw();
+    this.status.textContent = "Region deleted.";
+  }
+
+  _updateList() {
+    this.list.innerHTML = "";
+    this.regions.forEach((region, index) => {
+      const option = document.createElement("option");
+      option.value = index;
+      option.textContent = region.name;
+      this.list.appendChild(option);
+    });
+    if (this.selected >= 0) this.list.value = String(this.selected);
+  }
+
+  exportJSON() {
+    const blob = new Blob(
+      [JSON.stringify({ version: 1, regions: this.regions }, null, 2)],
+      { type: "application/json" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "hiro-touch-regions.json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  importFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!Array.isArray(data.regions)) {
+          throw new Error("Invalid regions JSON.");
+        }
+
+        this.regions = data.regions;
+        this.selected = this.regions.length ? 0 : -1;
+        this._updateList();
+        if (this.selected >= 0) this.selectRegion(this.selected);
+        this.redraw();
+        this.status.textContent = "Regions imported.";
+      } catch (error) {
+        this.status.textContent = `Import failed: ${error.message}`;
+      }
+    };
+
+    reader.readAsText(file);
+    event.target.value = "";
+  }
+}

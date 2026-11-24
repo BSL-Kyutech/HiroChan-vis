@@ -1,0 +1,500 @@
+/* python3 ~/icepi_ros2_bridge.py /dev/ttyUSB0 */
+
+/* ros2 launch rosbridge_server rosbridge_websocket_launch.xml *\
+
+
+
+
+
+/* cd ~/threejs-project
+npm run dev */
+
+import { TouchRegionEditor } from './touch-region-editor.js';
+import * as ROSLIB from 'roslib';
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+
+// -------------------------------------------------------------
+// 1. ROS 2 Bridge Connection & HUD
+// -------------------------------------------------------------
+const host = window.location.hostname || 'localhost';
+const statusBadge = document.getElementById('status-badge');
+const pressureBar = document.getElementById('pressure-bar');
+
+const ros = new ROSLIB.Ros();
+
+function connectRos() {
+    ros.connect(`ws://${host}:9090`);
+}
+
+ros.on('connection', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Connected';
+        statusBadge.className = 'hud-badge badge-connected';
+    }
+});
+
+ros.on('error', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Disconnected';
+        statusBadge.className = 'hud-badge badge-disconnected';
+    }
+    setTimeout(connectRos, 2500);
+});
+
+ros.on('close', () => {
+    if (statusBadge) {
+        statusBadge.textContent = 'Disconnected';
+        statusBadge.className = 'hud-badge badge-disconnected';
+    }
+});
+
+connectRos();
+
+const tactileTopic = new ROSLIB.Topic({
+    ros: ros,
+    name: '/tactile_sensors',
+    messageType: 'std_msgs/msg/Float32MultiArray'
+});
+
+// -------------------------------------------------------------
+// Rosbag Web Recording Controller
+// -------------------------------------------------------------
+const recBtn = document.getElementById('rec-btn');
+let isRecording = false;
+
+const recordService = new ROSLIB.Service({
+    ros: ros,
+    name: '/toggle_record',
+    serviceType: 'std_srvs/srv/SetBool'
+});
+
+if (recBtn) {
+    recBtn.addEventListener('click', () => {
+        const nextState = !isRecording;
+        recBtn.disabled = true;
+        recBtn.textContent = '...';
+
+        const timeout = setTimeout(() => {
+            recBtn.disabled = false;
+            recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            console.warn('Timed out waiting for /toggle_record service response.');
+        }, 4000);
+
+        // Pass a plain object directly instead of "new ROSLIB.ServiceRequest"
+        const request = {
+            data: nextState
+        };
+
+        recordService.callService(request, (result) => {
+            clearTimeout(timeout);
+            recBtn.disabled = false;
+            if (result && result.success) {
+                isRecording = nextState;
+                if (isRecording) {
+                    recBtn.textContent = '■ Stop Recording';
+                    recBtn.style.background = '#2b6cb0'; // Blue when recording
+                } else {
+                    recBtn.textContent = '● Record Bag';
+                    recBtn.style.background = '#e53e3e'; // Red when idle
+                }
+            } else {
+                console.warn('Service returned failure:', result?.message);
+                recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            }
+        }, (error) => {
+            clearTimeout(timeout);
+            recBtn.disabled = false;
+            recBtn.textContent = isRecording ? '■ Stop Recording' : '● Record Bag';
+            console.error('Failed to call /toggle_record service:', error);
+        });
+    });
+}
+
+// -------------------------------------------------------------
+// 2. Scene Setup
+// -------------------------------------------------------------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x222222);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
+camera.position.set(0, 2, 4);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
+dirLight.position.set(2, 4, 3);
+scene.add(dirLight);
+
+const headlight = new THREE.DirectionalLight(0xffffff, 1.2);
+headlight.position.set(0, 0, 1);
+camera.add(headlight);
+scene.add(camera);
+
+scene.add(new THREE.AxesHelper(1));
+scene.add(new THREE.GridHelper(3, 10));
+
+let robot = null;
+const robotMeshes = [];
+const activeShaders = [];
+
+const touchState = {
+    pos: new THREE.Vector3(0.0, 0.0, 0.0),
+    intensity: 0.0,
+    radius: 0.26,
+    depth: 0.5
+};
+let targetIntensity = 0.0;
+
+
+const touchMap = {
+    head_near_ears: [
+        "head_upper_left", "head_upper_right",
+        "head_lower_left", "head_lower_right"
+    ],
+    rear_head: [
+        "rear_head_upper_left", "rear_head_upper_right",
+        "rear_head_lower_left", "rear_head_lower_right"
+    ],
+    front_upper_body: [
+        "front_upper_left", "front_upper_right",
+        "front_middle_left", "front_middle_right",
+        "front_lower_left", "front_lower_right"
+    ],
+    back_upper_body: [
+        "back_upper_left", "back_upper_right",
+        "back_middle_left", "back_middle_right",
+        "back_lower_left", "back_lower_right"
+    ],
+    arms: [
+        "left_arm_front_1", "left_arm_front_2",
+        "left_arm_back_1", "left_arm_back_2",
+        "right_arm_front_1", "right_arm_front_2",
+        "right_arm_back_1", "right_arm_back_2"
+    ],
+    legs_feet: [
+        "left_leg_front_1", "left_leg_front_2", "left_foot_sole",
+        "left_foot_back_1", "left_foot_back_2", "left_foot_back_3",
+        "right_leg_front_1", "right_leg_front_2", "right_foot_sole",
+        "right_foot_back_1", "right_foot_back_2", "right_foot_back_3"
+    ]
+};
+
+// Hardware IDs deliberately remain unassigned.
+const sensorBindings = new Map();
+
+const markerMeshes = new Map();
+
+function createTouchMarkers(robot, size) {
+    const group = new THREE.Group();
+    group.name = "TouchMappingMarkers";
+
+    
+
+    const geometry = new THREE.SphereGeometry(
+        Math.max(size.x, size.y, size.z) * 0.012, 12, 8
+    );
+
+    for (const [id, x, y, z] of definitions) {
+        const material = new THREE.MeshBasicMaterial({
+            color: 0x00ff99,
+            depthTest: false
+        });
+
+        const marker = new THREE.Mesh(geometry, material);
+        marker.name = id;
+        marker.position.set(
+            x * size.x,
+            (y - 0.5) * size.y,
+            z * size.z
+        );
+        marker.renderOrder = 10;
+        marker.userData.logicalId = id;
+
+        group.add(marker);
+        markerMeshes.set(id, marker);
+    }
+
+    robot.add(group);
+    return group;
+}
+
+function setRegionActive(logicalId, active) {
+    const marker = markerMeshes.get(logicalId);
+    if (!marker) return;
+
+    marker.material.color.set(active ? 0xff4422 : 0x00ff99);
+    marker.scale.setScalar(active ? 1.7 : 1.0);
+}
+
+// -------------------------------------------------------------
+// 3. Deformable Shader Setup
+// -------------------------------------------------------------
+function setupDeformableMaterial(mat) {
+    mat.roughness = 0.1;
+    mat.metalness = 0.02;
+
+    mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uTouchPos = { value: touchState.pos };
+        shader.uniforms.uIntensity = { value: 0.0 };
+        shader.uniforms.uRadius = { value: touchState.radius };
+        shader.uniforms.uDepth = { value: touchState.depth };
+
+        activeShaders.push(shader);
+
+        shader.vertexShader = `
+            uniform vec3 uTouchPos;
+            uniform float uIntensity;
+            uniform float uRadius;
+            uniform float uDepth;
+            varying float vFactor;
+        ` + shader.vertexShader;
+
+        shader.vertexShader = shader.vertexShader.replace(
+            '#include <begin_vertex>',
+            `
+            #include <begin_vertex>
+            vec4 worldP = modelMatrix * vec4(position, 1.0);
+            vFactor = 0.0;
+
+            if (uIntensity > 0.02) {
+                float d = distance(worldP.xyz, uTouchPos);
+                if (d < uRadius) {
+                    vec3 localTouch = (inverse(modelMatrix) * vec4(uTouchPos, 1.0)).xyz;
+                    vec3 toTouch = localTouch - position;
+                    vec3 dirToTouch = normalize(toTouch);
+
+                    float front = clamp(dot(normal, dirToTouch) + 0.6, 0.0, 1.0);
+                    float r = d / uRadius;
+                    float indent = 0.5 * (1.0 + cos(r * 3.14159265));
+                    float disp = indent * uIntensity * front;
+
+                    transformed -= normal * (disp * uDepth);
+
+                    vec3 tangentSlope = toTouch - normal * dot(toTouch, normal);
+                    if (length(tangentSlope) > 1e-4) {
+                        tangentSlope = normalize(tangentSlope);
+                        objectNormal = normalize(objectNormal + tangentSlope * (disp * 3.0));
+                    }
+
+                    vFactor = disp;
+                }
+            }
+            `
+        );
+
+        shader.fragmentShader = `
+            varying float vFactor;
+
+            vec3 getTactileColor(float t) {
+                vec3 c0 = vec3(0.05, 0.20, 0.90);
+                vec3 c1 = vec3(0.00, 0.85, 0.95);
+                vec3 c2 = vec3(1.00, 0.85, 0.05);
+                vec3 c3 = vec3(0.95, 0.05, 0.05);
+
+                if (t < 0.33) return mix(c0, c1, t / 0.33);
+                else if (t < 0.66) return mix(c1, c2, (t - 0.33) / 0.33);
+                else return mix(c2, c3, (t - 0.66) / 0.34);
+            }
+        ` + shader.fragmentShader;
+
+        shader.fragmentShader = shader.fragmentShader.replace(
+            '#include <dithering_fragment>',
+            `
+            #include <dithering_fragment>
+            if (vFactor > 0.04) {
+                float p = clamp((vFactor - 0.04) * 4.0, 0.0, 1.0);
+                vec3 heat = getTactileColor(p);
+                gl_FragColor.rgb = mix(gl_FragColor.rgb, heat, clamp(p * 2.5, 0.0, 0.95));
+            }
+            `
+        );
+    };
+
+    mat.needsUpdate = true;
+}
+
+// -------------------------------------------------------------
+// 4. Model Loading
+// -------------------------------------------------------------
+const loader = new GLTFLoader();
+
+loader.load(
+    '/models/hiro-chan.glb',
+    (gltf) => {
+        robot = gltf.scene;
+
+        robot.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                child.geometry.deleteAttribute('normal');
+                child.geometry = BufferGeometryUtils.mergeVertices(child.geometry, 0.0015);
+                child.geometry.computeVertexNormals();
+
+                const normAttr = child.geometry.attributes.normal;
+                if (normAttr) {
+                    for (let i = 0; i < normAttr.count; i++) {
+                        const nx = normAttr.getX(i);
+                        const ny = normAttr.getY(i);
+                        const nz = normAttr.getZ(i);
+                        if (isNaN(nx) || isNaN(ny) || isNaN(nz) || (nx === 0 && ny === 0 && nz === 0)) {
+                            normAttr.setXYZ(i, 0, 1, 0);
+                        }
+                    }
+                    normAttr.needsUpdate = true;
+                }
+
+                robotMeshes.push(child);
+                child.material = child.material.clone();
+                child.material.flatShading = false;
+                child.material.side = THREE.FrontSide;
+                setupDeformableMaterial(child.material);
+            }
+        });
+
+        const box = new THREE.Box3().setFromObject(robot);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+
+        robot.position.sub(center);
+        scene.add(robot);
+        robot.updateMatrixWorld(true);
+
+        const regionEditor = new TouchRegionEditor({
+            scene,
+            camera,
+            renderer,
+            controls,
+            robot
+        });
+
+        setRegionActive("front_upper_left", true);
+        setRegionActive("rear_head_upper_left", true);
+
+        createTouchMarkers(robot, size);
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        camera.position.set(0, maxDim * 0.35, maxDim * 1.6);
+        controls.target.set(0, 0, 0);
+        controls.update();
+
+        const autoRay = new THREE.Raycaster(
+            new THREE.Vector3(0, 0.05, maxDim * 1.5),
+            new THREE.Vector3(0, 0, -1)
+        );
+        const hits = autoRay.intersectObjects(robotMeshes, true);
+        if (hits.length > 0) {
+            touchState.pos.copy(hits[0].point);
+        }
+    }
+);
+
+// -------------------------------------------------------------
+// 5. Hardware / Rosbag Touch Routing (Throttled & Time-Filtered)
+// -------------------------------------------------------------
+const THRESHOLD_LOW = 0.04;    // Release threshold
+const THRESHOLD_HIGH = 0.06;   // Press threshold
+const MAX_PRESSURE = 0.20;
+
+let lastProcessTime = 0;
+const THROTTLE_MS = 16;        // Limit processing to ~60 Hz
+
+let highSince = 0;             // Timestamp when pressure first crossed threshold
+const MIN_TOUCH_DURATION_MS = 40; // Must stay pressed for >40ms to count (kills spikes)
+
+tactileTopic.subscribe((msg) => {
+    const now = performance.now();
+
+    // Throttle: ignore excess messages from the 1200+ Hz flood
+    if (now - lastProcessTime < THROTTLE_MS) {
+        return;
+    }
+    lastProcessTime = now;
+
+    if (!msg.data || msg.data.length === 0) return;
+
+    let maxVal = 0.0;
+    for (let i = 0; i < msg.data.length; i++) {
+        if (msg.data[i] > maxVal) {
+            maxVal = msg.data[i];
+        }
+    }
+
+    // Time-based anti-spike logic
+    if (maxVal >= THRESHOLD_HIGH) {
+        if (highSince === 0) {
+            highSince = now; // Start tracking contact duration
+        }
+    } else if (maxVal < THRESHOLD_LOW) {
+        highSince = 0; // Released
+    }
+
+    // Reject short spikes lasting under 40 milliseconds
+    if (highSince === 0 || (now - highSince) < MIN_TOUCH_DURATION_MS) {
+        targetIntensity = 0.0;
+        if (pressureBar) pressureBar.style.width = '0%';
+        return;
+    }
+
+    // Remap to 0.0 - 1.0 range
+    const range = MAX_PRESSURE - THRESHOLD_LOW;
+    const normalized = Math.min(Math.max((maxVal - THRESHOLD_LOW) / range, 0.0), 1.0);
+
+    targetIntensity = normalized;
+    if (pressureBar) {
+        pressureBar.style.width = `${normalized * 100}%`;
+    }
+});
+
+// -------------------------------------------------------------
+// 6. Window Resize
+// -------------------------------------------------------------
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// -------------------------------------------------------------
+// 7. Animation Loop
+// -------------------------------------------------------------
+let lastTime = performance.now();
+
+renderer.setAnimationLoop(() => {
+    const now = performance.now();
+    const delta = Math.min((now - lastTime) / 1000, 0.1);
+    lastTime = now;
+
+    touchState.intensity = THREE.MathUtils.damp(
+        touchState.intensity,
+        targetIntensity,
+        25.0,
+        delta
+    );
+
+    // Snap cleanly to zero
+    if (touchState.intensity < 0.01) {
+        touchState.intensity = 0.0;
+    }
+
+    // Direct uniform binding per frame
+    for (let i = 0; i < activeShaders.length; i++) {
+        const u = activeShaders[i].uniforms;
+        if (u && u.uIntensity) {
+            u.uIntensity.value = touchState.intensity;
+            u.uTouchPos.value.copy(touchState.pos);
+        }
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+});
